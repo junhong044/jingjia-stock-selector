@@ -2,13 +2,12 @@ name: 竞价选股（云端）
 
 on:
   schedule:
-    # 北京时间 9:31 / 9:33 / 9:35（UTC 1:31/1:33/1:35），工作日
-    # 说明：竞价成交额取自腾讯分时「09:30 首条」，9:30 开盘后才生成，
-    #       故调度定在 9:31 之后（原 Tushare 版可 9:25 跑，免费源做不到）。
-    #       跑三次是为了容错：首次若数据未就绪/接口抖动，后续可补。
-    - cron: '31 1 * * 1-5'
-    - cron: '33 1 * * 1-5'
-    - cron: '35 1 * * 1-5'
+    # 北京时间 9:26（UTC 1:26），工作日 —— 开盘前推送
+    # 说明：改用腾讯批量快照模式(--early)：竞价价=快照「今开」(9:25撮合价)、
+    #       竞价额=快照成交额，9:25 撮合完成即写入快照，无需等 9:30 分时首条。
+    #       脚本内 fetch_with_retry 会等待重试(约40秒)，覆盖撮合数据写入延迟。
+    #       注意：快照成交额在 9:30 后变为当日累计额，故本模式务必在 9:30 前跑。
+    - cron: '26 1 * * 1-5'
   workflow_dispatch:
     inputs:
       date:
@@ -37,4 +36,9 @@ jobs:
           TZ: Asia/Shanghai
         run: |
           cd scripts
-          python run_daily.py ${{ github.event.inputs.date != '' && format('--date {0}', github.event.inputs.date) || '' }}
+          # 定时触发走 --early 快照模式(9:26)；手动指定日期时可用普通模式(回测历史)
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python run_daily.py --date "${{ github.event.inputs.date }}"
+          else
+            python run_daily.py --early
+          fi
