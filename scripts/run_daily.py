@@ -17,6 +17,7 @@ import sys
 import time
 
 import free_data as fd
+import strategy_v6 as s6
 
 
 def fetch_with_retry(fn, name, max_retries=4, base_wait=3):
@@ -96,109 +97,34 @@ def main():
 
     auc_map = {c: (p, gap, amt) for c, (p, gap, amt) in today_auction.items()}
 
-    # ---------- 评分 ----------
-    zt_set = set(prev_zt.keys())
-    print(f"  候选池: {len(zt_set)}只")
+    # ---------- 评分（v6 优化版） ----------
+    ind_map = s6.industry_stats(prev_zt)
+    # 情绪判定（v6 新增：退潮日降分）——与报告段口径保持一致
+    max_lt_pre = max((r.get("limit_times", 1) for r in prev_zt.values()), default=1)
+    n3_pre = sum(1 for r in prev_zt.values() if r.get("limit_times") == 3)
+    n4_pre = sum(1 for r in prev_zt.values() if r.get("limit_times") == 4)
+    r34_pre = n4_pre / n3_pre * 100 if n3_pre > 0 else 0
+    mood = "退潮" if (r34_pre < 20 or max_lt_pre < 3) else ""
+    print(f"  板块联动: {len(ind_map)}个行业 / 退潮判定: {'是' if mood else '否'}")
 
-    cand = []
-    for code, r in prev_zt.items():
-        name = r["name"]
-        if "ST" in name or code.startswith(("4", "8", "9")):   # 排除北交所
-            continue
-        mv = r["float_mv"] / 1e8 if r["float_mv"] else 0
-        if mv < 20:
-            continue
-        if code not in auc_map:
-            continue
+    # 股性：近10日涨停次数（用已获取的日历+涨停池，成本可控）
+    gx_map = {}
+    prev_codes = set(prev_zt.keys())
+    cal_all = fd.trade_days("20260101", target)
+    idx_target = cal_all.index(target) if target in cal_all else len(cal_all)
+    recent10 = cal_all[max(0, idx_target - 10):idx_target]
+    for d in recent10:
+        try:
+            pool_d = fd.zt_pool(d) if d != prev else prev_zt
+        except Exception:
+            pool_d = {}
+        for c in pool_d:
+            if c in prev_codes:
+                gx_map[c] = gx_map.get(c, 0) + 1
+        if d != prev:
+            time.sleep(0.1)
 
-        buy_p, gap, auc_amt = auc_map[code]
-        if gap < -3:
-            continue
-        vr = auc_amt / (mv * 1e8) * 100
-        if vr < 0.05:
-            continue
-
-        lt = int(r.get("limit_times", 1))
-        pa = r.get("amount", 0) or 0
-        fa = r.get("fd_amount", 0) or 0
-        ot = int(r.get("open_times", 0) or 0)
-        ls = str(r.get("last_time", ""))
-        lr = fa / pa * 100 if pa > 0 else 0
-        if lr < 5:
-            continue
-
-        is_lb = ot >= 2 or (ls and ls != "nan" and ls.isdigit() and int(ls) > 143000)
-
-        # v5 评分
-        if mv > 200:
-            a = 5 if vr >= 0.5 else 4 if vr >= 0.3 else 4 if vr >= 0.2 else 3 if vr >= 0.1 else 2
-        else:
-            a = 5 if vr >= 0.5 else 4 if vr >= 0.3 else 3 if vr >= 0.2 else 2 if vr >= 0.1 else 1
-        if vr > 1.0:
-            a -= 0.5
-
-        if 8 <= gap < 10:
-            b = 5
-        elif gap >= 10:
-            b = 4.5
-        elif 3 <= gap < 8:
-            b = 4
-        elif gap >= 1:
-            b = 3
-        elif gap >= -0.5:
-            b = 3
-        else:
-            b = 2
-
-        c_s = 4.5 if lt == 3 else 4 if lt == 2 else 2.5 if lt == 1 else 2
-        d_s = 4
-
-        if lt >= 2 and gap >= 6 and vr > 0.3:
-            e = 5 if not is_lb else 4
-        elif lt >= 2 and gap >= 4:
-            e = 4 if not is_lb else 3
-        elif lt >= 2 and gap >= 1:
-            e = 2
-        elif lt >= 2:
-            e = 2
-        elif lt == 1 and gap >= 6:
-            e = 3
-        elif lt == 1 and gap >= 3:
-            e = 2.5
-        elif lt == 1 and gap >= 1:
-            e = 2
-        else:
-            e = 2
-
-        risk = 0
-        if lr < 10:
-            risk += 2
-        elif lr < 30:
-            risk += 1.5
-        elif lr < 50:
-            risk += 0.5
-        if lt >= 4:
-            risk += 2
-        if lt >= 3 and gap < 2:
-            risk += 1
-        if mv >= 500:
-            risk -= 1
-        elif mv >= 200:
-            risk -= 0.5
-        if is_lb:
-            risk += 0.5
-
-        raw = a * 0.25 + b * 0.20 + c_s * 0.15 + d_s * 0.20 + e * 0.20
-        score = raw * 4 - risk
-
-        if score >= 14:
-            cand.append({
-                "name": name, "code": fd.to_ts_code(code), "score": round(score, 1),
-                "gap": round(gap, 1), "lt": lt, "vr": round(vr, 3),
-                "mv": round(mv, 0), "e": round(e, 1),
-            })
-
-    cand.sort(key=lambda x: x["score"], reverse=True)
+    cand = s6.pick_top(prev_zt, auc_map, threshold=14.0, gx_map=gx_map, mood=mood, limit=3)
     top3 = cand[:3]
 
     # ---------- 组装报告（同时打印与推送） ----------
@@ -220,11 +146,19 @@ def main():
         lines.append("\n## 二、📋 观察池（退潮防守期，不推荐买入）")
     else:
         lines.append(f"\n## 二、🏆 首选买入池 (TOP{len(top3)})")
-    lines.append("| 股票 | 代码 | 连板 | 竞开% | 量比% | 评分 |")
-    lines.append("|---:|---:|---:|---:|---:|---:|")
+    lines.append("| 股票 | 代码 | 连板 | 竞开% | 量比% | 板块 | 评分 | 提示 |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|:---|")
     for c in top3:
+        tags = []
+        if c.get("vol_trap"):
+            tags.append("高开无量")
+        if c.get("yizi"):
+            tags.append("一字难买")
+        if c.get("ind_cnt", 0) <= 1:
+            tags.append("孤立无板块")
         lines.append(f"| {c['name']} | {c['code']} | {c['lt']}板 | "
-                     f"{c['gap']:+5.1f}% | {c['vr']:>4.2f}% | {c['score']:>4.1f} |")
+                     f"{c['gap']:+5.1f}% | {c['vr']:>4.2f}% | {c.get('ind_cnt', 0)}只 | "
+                     f"{c['score']:>4.1f} | {'/'.join(tags) or '—'} |")
 
     lines.append("\n## 三、最终结论")
     if is_defense:
@@ -238,7 +172,7 @@ def main():
             lines.append(f"  首选: {best['name']}({best['code']}) {best['score']}分")
 
     lines.append("\n> ⚠️ 仅策略研究，不构成投资建议")
-    lines.append(f"> 📅 {target} · 数据源: 腾讯+东方财富(免费)")
+    lines.append(f"> 📅 {target} · 数据源: 腾讯+东方财富(免费) · 策略: v6(板块联动+量价匹配)")
 
     report = "\n".join(lines)
     print("\n" + report)
