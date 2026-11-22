@@ -289,9 +289,58 @@ def tx_snapshot(codes: list[str]) -> dict[str, dict]:
             except (IndexError, ValueError):
                 return 0.0
 
+        # 成交额：field[35] = "现价/成交量手/成交额元"，取第3项
+        amount = 0.0
+        if len(f) > 35 and "/" in f[35]:
+            try:
+                amount = float(f[35].split("/")[2])
+            except (IndexError, ValueError):
+                amount = 0.0
         out[f[2]] = {
             "code": f[2], "name": f[1], "price": _n(3),
             "pre_close": _n(4), "open": _n(5),
-            "volume_hand": _n(6), "time": f[30] if len(f) > 30 else "",
+            "volume_hand": _n(6), "amount": amount,
+            "time": f[30] if len(f) > 30 else "",
         }
+    return out
+
+
+def auction_batch_snapshot(codes: list[str], trade_date: str | None = None,
+                           batch: int = 60, progress: bool = True) -> dict[str, tuple]:
+    """集合竞价批量数据（快照版，9:25 撮合后即可用，无需等 9:30 分时首条）。
+
+    返回 {code6: (price, gap_pct, amount元)}，与 auction_batch 口径一致。
+      · 竞价价 = 快照「今开」字段（9:25 撮合价）
+      · 竞价额 = 快照成交额（9:25~9:30 为竞价成交额，9:30 后为当日累计）
+      · 昨收 = 快照 pre_close（盘中即当日昨收，正确）
+
+    关键差异：腾讯批量快照一次请求可查 60+ 只，比分时接口逐只查快一个数量级，
+    且「今开」在 9:25 撮合完成即写入快照，因此可支撑 9:26 推送。
+    trade_date 仅用于兼容接口；快照本身取实时，调用方应确保当天为交易日。
+    """
+    out: dict[str, tuple] = {}
+    total = len(codes)
+    for i in range(0, total, batch):
+        chunk = codes[i:i + batch]
+        try:
+            snaps = tx_snapshot(chunk)
+        except Exception as e:      # noqa: BLE001
+            if progress:
+                print(f"    [竞价快照] 批次失败({type(e).__name__}): {e}")
+            continue
+        for c in chunk:
+            s = snaps.get(to_em_code(c))
+            if not s:
+                continue
+            price = s.get("open") or 0.0
+            pre = s.get("pre_close") or 0.0
+            amount = s.get("amount") or 0.0
+            if price <= 0 or pre <= 0:
+                continue
+            # 9:25 后若「今开」仍为昨收(未撮合)，gap≈0，交由调用方重试逻辑处理
+            gap = (price / pre - 1) * 100
+            out[to_em_code(c)] = (price, gap, amount)
+        if progress and total > batch:
+            print(f"    [竞价快照] 进度 {min(i + batch, total)}/{total}")
+        time.sleep(0.1)
     return out
