@@ -58,6 +58,9 @@ def get_recent_days(target_date=None):
 def main():
     parser = argparse.ArgumentParser(description="v5竞价选股（免费数据源）")
     parser.add_argument("--date", type=str, help="目标日期 YYYYMMDD")
+    parser.add_argument("--early", action="store_true",
+                        help="早盘快照模式(9:26)：用腾讯批量快照的今开/成交额，"
+                             "9:25撮合后即可用；默认用分时09:30首条(9:31后)")
     args = parser.parse_args()
 
     days = get_recent_days(args.date)
@@ -84,12 +87,21 @@ def main():
     print(f"  ✅ 昨日涨停 {len(prev_zt)} 只")
 
     # ---------- 今日竞价 ----------
-    print("  获取今日竞价数据（等待数据更新）...")
+    mode = "快照(9:25撮合价)" if args.early else "分时09:30首条"
+    print(f"  获取今日竞价数据（{mode}，等待数据更新）...")
     codes = list(prev_zt.keys())
-    today_auction = fetch_with_retry(
-        lambda: fd.auction_batch(codes, target, progress=False),
-        "竞价", max_retries=6, base_wait=4,
-    )
+    if args.early:
+        # 9:26 快照模式：批量一次拉全，今开=竞价价，成交额=竞价额
+        # 注意 9:30 后快照成交额会变成当日累计额，故此模式只在 9:30 前用
+        today_auction = fetch_with_retry(
+            lambda: fd.auction_batch_snapshot(codes, target, progress=False),
+            "竞价快照", max_retries=6, base_wait=4,
+        )
+    else:
+        today_auction = fetch_with_retry(
+            lambda: fd.auction_batch(codes, target, progress=False),
+            "竞价", max_retries=6, base_wait=4,
+        )
     if not today_auction:
         print("  ❌ 竞价数据多次重试后仍为空，可能今日非交易日或接口异常")
         sys.exit(1)
